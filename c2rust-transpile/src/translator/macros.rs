@@ -1,0 +1,281 @@
+use c2rust_ast_builder::mk;
+use failure::format_err;
+use log::{info, trace};
+use proc_macro2::{Span, TokenStream};
+use std::rc::Rc;
+use syn::{Expr, MacroDelimiter};
+
+use crate::c_ast::{CDeclId, CExprId, CQualTypeId, CTypeId, CTypeKind, MacroInvocationInfo};
+use crate::diagnostics::{TranslationError, TranslationResult};
+use crate::translator::{ConvertedDecl, ConvertedMacro, ExprContext, Translation};
+use crate::with_stmts::WithStmts;
+use crate::TranslateMacros;
+
+impl<'c> Translation<'c> {
+    pub fn convert_macro(
+        &self,
+        ctx: ExprContext,
+        decl_id: CDeclId,
+        span: Span,
+        name: &str,
+    ) -> ConvertedDecl {
+        trace!(
+            "Expanding macro {:?}: {:?}",
+            decl_id,
+            self.ast_context[decl_id]
+        );
+
+        self.recreate_const_macro_from_expansions(ctx, decl_id)
+            .and_then(|(replacement, converted)| {
+                trace!("  to {:?}", replacement);
+
+                let ty = self.convert_type(converted.ty)?;
+                self.converted_macros
+                    .borrow_mut()
+                    .insert(decl_id, Some(Rc::new(converted)));
+
+                Ok(ConvertedDecl::Item(mk().span(span).pub_().const_item(
+                    name,
+                    ty,
+                    replacement,
+                )))
+            })
+            .unwrap_or_else(|e| {
+                self.converted_macros.borrow_mut().insert(decl_id, None);
+                info!("Could not expand macro {}: {}", name, e);
+                ConvertedDecl::NoItem
+            })
+    }
+
+    /// Given all of the expansions of a const macro,
+    /// try to recreate a Rust `const` translation
+    /// that is equivalent to every expansion.
+    ///
+    /// This may fail, in which case we simply don't emit a `const`
+    /// and leave all of the expansions as fully inlined
+    /// instead of referencing this `const`.
+    ///
+    /// For example, if the types of the macro expansion have no common type,
+    /// which is required for a Rust `const` but not a C const macro,
+    /// this can fail.  Or there could just be a feature we don't yet support.
+    fn recreate_const_macro_from_expansions(
+        &self,
+        ctx: ExprContext,
+        macro_id: CDeclId,
+    ) -> TranslationResult<(Box<Expr>, ConvertedMacro)> {
+        struct ConvertedMacroExpr {
+            val: WithStmts<Box<Expr>>,
+            ty: CTypeId,
+        }
+
+        let ctx = ctx.const_().set_expanding_macro(macro_id);
+        let canonical = self.ast_context.macro_expansions[&macro_id]
+            .iter()
+            .try_fold::<Option<ConvertedMacroExpr>, _, _>(None, |canonical, info| {
+                let &MacroInvocationInfo { expr_id, .. } = info.as_ref();
+                self.can_convert_const_macro_expansion(expr_id)?;
+
+                let ty = self
+                    .ast_context
+                    .index_unwrap_parens(expr_id)
+                    .kind
+                    .get_type()
+                    .ok_or_else(|| format_err!("Invalid expression type"))?;
+                let val = self.convert_expr(ctx.used(), expr_id, None)?;
+                let new = ConvertedMacroExpr { val, ty };
+
+                // Join ty and cur_ty to the smaller of the two types. If the
+                // types are not cast-compatible, abort the fold.
+                let ty_kind = self.ast_context.resolve_type(new.ty).kind.clone();
+                if let Some(canonical) = canonical {
+                    let canon_ty_kind = self.ast_context.resolve_type(canonical.ty).kind.clone();
+                    if let Some(smaller_ty) =
+                        CTypeKind::smaller_compatible_type(canon_ty_kind.clone(), ty_kind)
+                    {
+                        if smaller_ty == canon_ty_kind {
+                            Ok(Some(canonical))
+                        } else {
+                            Ok(Some(new))
+                        }
+                    } else {
+                        Err(format_err!("Not all macro expansions are compatible types"))
+                    }
+                } else {
+                    Ok(Some(new))
+                }
+            })?
+            .ok_or_else(|| format_err!("Could not find a valid type for macro"))?;
+
+        let ConvertedMacroExpr { val, ty } = canonical;
+        let converted = ConvertedMacro { ty };
+        val.wrap_unsafe()
+            .to_pure_expr()
+            .map(|val| (val, converted))
+            .ok_or_else(|| TranslationError::generic("Macro expansion is not a pure expression"))
+
+        // TODO: Validate that all replacements are equivalent and pick the most
+        // common type to minimize casts.
+    }
+
+    /// Determine if we're able to convert this const macro expansion.
+    fn can_convert_const_macro_expansion(&self, expr_id: CExprId) -> TranslationResult<()> {
+        // Bitfield struct initializers are lowered to non-`const` setter calls,
+        // so they can't be emitted as a `const` item.
+        if self.expr_initializes_bitfield(expr_id) {
+            Err(format_err!(
+                "macro initializes a bitfield, which is not const"
+            ))?;
+        }
+
+        match self.tcfg.translate_const_macros {
+            TranslateMacros::None => Err(format_err!("translate_const_macros is None"))?,
+            TranslateMacros::Conservative => {
+                // TODO We still allow `CExprKind::ExplicitCast`s
+                // even though they're broken (see #853).
+
+                // This is a top-down, pessimistic/conservative analysis.
+                // This is somewhat duplicative of `fn convert_expr` simply checking
+                // `ExprContext::is_const` and returning errors where the expr is not `const`,
+                // which is an non-conservative analysis scattered across all of the `fn convert_*`s.
+                // That's what's done for `TranslateMacros::Experimental`,
+                // as opposed to the conservative analysis done here for `TranslateMacros::Conservative`.
+                // When the conservative analysis is incomplete,
+                // it won't translate the macro, but the result will compile.
+                // But when the non-conservative analysis is incomplete,
+                // the resulting code may not transpile,
+                // which is why the conservative analysis is used for `TranslateMacros::Conservative`.
+                if !self.ast_context.is_const_expr(expr_id) {
+                    Err(format_err!("non-const expr {expr_id:?}"))?;
+                }
+                Ok(())
+            }
+            TranslateMacros::Experimental => Ok(()),
+        }
+    }
+
+    /// Convert the expansion of a const-like macro.
+    ///
+    /// See [`TranspilerConfig::translate_const_macros`].
+    ///
+    /// [`TranspilerConfig::translate_const_macros`]: crate::TranspilerConfig::translate_const_macros
+    pub fn convert_const_macro_expansion(
+        &self,
+        ctx: ExprContext,
+        expr_id: CExprId,
+        override_ty: Option<CQualTypeId>,
+    ) -> TranslationResult<Option<WithStmts<Box<Expr>>>> {
+        let macros = match self.ast_context.macro_invocations.get(&expr_id) {
+            Some(macros) => macros.as_slice(),
+            None => return Ok(None),
+        };
+
+        // Find the first macro after the macro we're currently expanding, if any.
+        let first_macro = macros
+            .splitn(2, |info| ctx.expanding_macro(&info.macro_id))
+            .last()
+            .unwrap()
+            .first();
+        let info = match first_macro {
+            Some(info) => info,
+            None => return Ok(None),
+        };
+
+        trace!("  found macro expansion: {:?}", info.macro_id);
+        // Ensure that we've converted this macro and that it has a valid definition.
+        let maybe_converted = self.converted_macros.borrow().get(&info.macro_id).cloned();
+        let converted = match maybe_converted {
+            // Macro was converted previously.
+            Some(Some(converted)) => converted,
+
+            // Macro failed to convert previously.
+            Some(None) => return Ok(None),
+
+            // We haven't tried to convert it yet.
+            None => {
+                self.convert_decl(ctx.not_pattern(), info.macro_id)?;
+                let maybe_converted = self.converted_macros.borrow().get(&info.macro_id).cloned();
+                if let Some(Some(converted)) = maybe_converted {
+                    converted
+                } else {
+                    return Ok(None);
+                }
+            }
+        };
+        let rust_name = self
+            .renamer
+            .borrow_mut()
+            .get(&info.macro_id)
+            .ok_or_else(|| format_err!("Macro name not declared"))?;
+
+        self.add_import(info.macro_id, &rust_name);
+
+        let mut val = WithStmts::new_val(mk().path_expr(vec![rust_name]));
+
+        let expr_kind = &self.ast_context.index_unwrap_parens(expr_id).kind;
+        // TODO We'd like to get rid of this cast eventually (see #1321).
+        // Currently, const macros do not get the correct `override_ty` themselves,
+        // so they aren't declared with the correct portable type,
+        // but its uses are expecting the correct portable type,
+        // so we need to cast it to the `override_ty` here.
+        let expr_ty = override_ty.or_else(|| expr_kind.get_qual_type());
+        if let Some(expr_ty) = expr_ty {
+            match self.make_cast(ctx, CQualTypeId::new(converted.ty), expr_ty, val) {
+                Ok(new_val) => val = new_val,
+                Err(err) => {
+                    info!(
+                        "Could not convert cast of macro {} for {:?}: {}",
+                        self.renamer.borrow_mut().get(&info.macro_id).unwrap(),
+                        expr_id,
+                        err
+                    );
+                    return Ok(None);
+                }
+            }
+        }
+
+        // TODO: May need to handle volatile reads here.
+        // See `DeclRef` below.
+
+        Ok(Some(val))
+    }
+
+    /// Convert the expansion of a function-like macro.
+    ///
+    /// See [`TranspilerConfig::translate_fn_macros`].
+    ///
+    /// [`TranspilerConfig::translate_fn_macros`]: crate::TranspilerConfig::translate_fn_macros
+    pub fn convert_fn_macro_invocation(
+        &self,
+        _ctx: ExprContext,
+        text: &str,
+    ) -> Option<WithStmts<Box<Expr>>> {
+        match self.tcfg.translate_fn_macros {
+            TranslateMacros::None => return None,
+            TranslateMacros::Conservative => return None, // Nothing is supported for `Conservative` yet.
+            TranslateMacros::Experimental => {}
+        }
+
+        let mut split = text.splitn(2, '(');
+        let ident = split.next()?.trim();
+        let args = split.next()?.trim_end_matches(')');
+
+        let ts: TokenStream = syn::parse_str(args).ok()?;
+        Some(WithStmts::new_val(mk().mac_expr(mk().mac(
+            mk().path(ident),
+            ts,
+            MacroDelimiter::Paren(Default::default()),
+        ))))
+    }
+
+    pub fn expr_is_expanded_macro(
+        &self,
+        ctx: ExprContext,
+        expr_id: CExprId,
+        override_ty: Option<CQualTypeId>,
+    ) -> bool {
+        matches!(
+            self.convert_const_macro_expansion(ctx, expr_id, override_ty),
+            Ok(Some(_))
+        )
+    }
+}
