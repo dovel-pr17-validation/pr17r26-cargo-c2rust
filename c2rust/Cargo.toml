@@ -14,7 +14,7 @@ categories.workspace = true
 default-run = "c2rust"
 
 [dependencies]
-anyhow = "1.0"
+anyhow = "1.0.104"
 clap = { version = "3.2.22", features = ["yaml", "cargo", "derive"] }
 env_logger = "0.10"
 is_executable = "1.0"
