@@ -14,7 +14,7 @@ categories.workspace = true
 publish = false
 
 [dependencies]
-anyhow = "1.0"
+anyhow = "1.0.104"
 bincode = "1.0.1"
 c2rust-analysis-rt = { path = "../analysis/runtime", version = "0.22.1" }
 indexmap = "1.9"
